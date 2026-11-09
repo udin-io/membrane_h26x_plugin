@@ -113,54 +113,34 @@ defmodule Membrane.H265.NALuParser.Schemes.SPS do
           save_state_as_global_state: {&{:sps, &1}, [:seq_parameter_set_id]}
         ]
 
+  # scaling_list_data() of H.265, section 7.3.4. Only the position after the lists
+  # matters here, so the coefficients are read and dropped.
   defp scaling_list(payload, state, _iterators) do
-    {payload, state} =
-      Enum.reduce(0..3, {payload, state}, fn i, {payload, state} ->
-        {payload, state, _next_coeff} = read_scaling_list(payload, state, i)
-        {payload, state}
-      end)
+    payload =
+      for size_id <- 0..3,
+          _matrix_id <- 0..5//if(size_id == 3, do: 3, else: 1),
+          reduce: payload do
+        payload -> skip_scaling_list(payload, size_id)
+      end
 
     {:ok, payload, state}
   end
 
-  defp read_scaling_list(payload, state, idx) do
-    range = if idx == 3, do: 0..5//3, else: 0..5
-
-    Enum.reduce(range, {payload, state, 8}, fn i, {payload, state, next_coeff} ->
-      do_calculate_scaling_list(payload, state, next_coeff, i)
-    end)
+  defp skip_scaling_list(<<0::1, payload::bitstring>>, _size_id) do
+    {_pred_matrix_id_delta, payload} = ExpGolombConverter.to_integer(payload)
+    payload
   end
 
-  defp do_calculate_scaling_list(payload, state, next_coeff, idx) do
-    <<pred_mode_flag::1, payload::binary>> = payload
+  defp skip_scaling_list(<<1::1, payload::bitstring>>, size_id) do
+    coef_num = min(64, 1 <<< (4 + (size_id <<< 1)))
 
-    if pred_mode_flag == 0 do
-      {_number, payload} = ExpGolombConverter.to_integer(payload)
-      {payload, state, next_coeff}
-    else
-      coef_num = min(64, 1 <<< (4 + (idx <<< 1)))
+    # Lists of size id 2 and 3 open with scaling_list_dc_coef_minus8.
+    signed_values = if size_id > 1, do: coef_num + 1, else: coef_num
 
-      {payload, next_coeff} =
-        if idx > 1 do
-          {scaling_list_coeff, payload} =
-            ExpGolombConverter.to_integer(payload, negatives: false)
-
-          next_coeff = scaling_list_coeff + 8
-
-          {payload, next_coeff}
-        else
-          {payload, next_coeff}
-        end
-
-      Enum.reduce(0..coef_num, {payload, state, next_coeff}, fn _i,
-                                                                {payload, state, next_coeff} ->
-        {delta_coeff, payload} = ExpGolombConverter.to_integer(payload, negatives: false)
-
-        next_coeff = rem(next_coeff + delta_coeff + 256, 256)
-
-        {payload, state, next_coeff}
-      end)
-    end
+    Enum.reduce(1..signed_values, payload, fn _i, payload ->
+      {_value, payload} = ExpGolombConverter.to_integer(payload, negatives: true)
+      payload
+    end)
   end
 
   defp st_ref_pic_set(
